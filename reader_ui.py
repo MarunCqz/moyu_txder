@@ -1,4 +1,4 @@
-"""Reader UI: virtual text rendering, progress management, transparency effects."""
+"""Reader UI v2: borderless window, overlay controls, true transparency."""
 
 import os
 import json
@@ -18,6 +18,10 @@ def _app_dir():
 
 
 PROGRESS_FILE = os.path.join(_app_dir(), 'progress.json')
+
+# Sentinel colour used for transparent-background pixels.
+# Must be a colour the user would never pick for text or background.
+TRANS = '#010203'
 
 
 # ── Progress Manager ───────────────────────────────────────────
@@ -80,36 +84,44 @@ class ProgressManager:
 # ── Reader Application ─────────────────────────────────────────
 
 class ReaderApp:
-    """Main reader window with virtual text rendering."""
+    """Borderless text reader with overlay controls and true transparency."""
 
     def __init__(self):
         self.fh = FileHandler()
         self.pm = ProgressManager()
 
         self.root = tk.Tk()
-        self.root.title('TXT Reader')
 
-        # Display state
+        # ── borderless + transparent-background capable ─────────
+        self.root.overrideredirect(True)
+        self.root.configure(bg=TRANS)
+        self.root.attributes('-transparentcolor', TRANS)
+        self.root.attributes('-alpha', 1.0)
+
+        # ── state ───────────────────────────────────────────────
         self.top_line = 0
-        self.font_color = '#D4D4D4'
+        self.font_color = '#E0E0E0'
+        self.bg_color = TRANS               # TRANS = fully transparent
         self.font_family = 'Microsoft YaHei'
         self.font_size = 14
         self.line_height = 22
-
-        # Transparency state
         self._hovering = False
-
-        self.root.configure(bg='#1e1e1e')
-        self.root.attributes('-alpha', 0.55)
+        self._controls_up = False
+        self._info_up = False
+        self._on_top = False
+        self._drag_x = 0
+        self._drag_y = 0
+        self._resize_mode = ''
+        self._resize_margin = 6
 
         self._calc_line_height()
         self._build_ui()
+        self._build_context_menu()
         self._bind_events()
 
-        # Auto-load last file after UI settles
         self.root.after(100, self._load_last_session)
 
-    # ── Layout constants ────────────────────────────────────────
+    # ── helpers ─────────────────────────────────────────────────
 
     def _calc_line_height(self):
         self.line_height = max(16, int(self.font_size * 1.55))
@@ -117,91 +129,146 @@ class ReaderApp:
     # ── UI Construction ─────────────────────────────────────────
 
     def _build_ui(self):
-        self.outer = tk.Frame(self.root, bg='#1e1e1e')
-        self.outer.pack(fill=tk.BOTH, expand=True)
+        # --- canvas fills the entire window ----------------------
+        self.canvas = tk.Canvas(
+            self.root, bg=TRANS, highlightthickness=0, bd=0,
+            cursor='xterm',
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        # Control bar
+        # --- resize grip (bottom-right) --------------------------
+        self._grip_size = 14
+        self.grip = tk.Label(
+            self.root, text='', bg='#333333', cursor='bottom_right_corner',
+        )
+
+        # --- control overlay (top, placed on hover) --------------
+        self._ctrl_h = 34
+        self.ctrl_frame = tk.Frame(self.root, bg='#2d2d2d', height=self._ctrl_h)
+        self.ctrl_frame.pack_propagate(False)
         self._build_control_bar()
 
-        # Content area: canvas + scrollbar
-        self.content = tk.Frame(self.outer, bg='#1e1e1e')
-        self.content.pack(fill=tk.BOTH, expand=True)
-
-        self.canvas = tk.Canvas(
-            self.content, bg='#1e1e1e', highlightthickness=0,
-            bd=0, cursor='xterm',
-        )
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # Scrollbar as a draggable Scale
-        self.scroll_var = tk.DoubleVar(value=0)
-        self.scrollbar = tk.Scale(
-            self.content, from_=100, to=0, orient=tk.VERTICAL,
-            variable=self.scroll_var, command=self._on_scrollbar_drag,
-            bg='#2a2a2a', fg='#666666', troughcolor='#333333',
-            highlightthickness=0, bd=0, showvalue=False,
-            width=10, sliderlength=30, sliderrelief=tk.FLAT,
-        )
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Info bar at the bottom
+        # --- info overlay (bottom, placed on hover) --------------
+        self._info_h = 24
+        self.info_frame = tk.Frame(self.root, bg='#252525', height=self._info_h)
+        self.info_frame.pack_propagate(False)
         self.info_var = tk.StringVar(value='')
-        self.info_label = tk.Label(
-            self.outer, textvariable=self.info_var,
-            bg='#252525', fg='#777777',
-            font=('Microsoft YaHei', 9), anchor=tk.W, padx=8, pady=2,
+        self.info_lbl = tk.Label(
+            self.info_frame, textvariable=self.info_var,
+            bg='#252525', fg='#999999',
+            font=('Microsoft YaHei', 9), anchor=tk.W,
         )
-        self.info_label.pack(fill=tk.X, side=tk.BOTTOM)
-
-        # Start with controls hidden
-        self._hide_controls()
+        self.info_lbl.pack(fill=tk.BOTH, expand=True, padx=8)
 
     def _build_control_bar(self):
-        self.control_bar = tk.Frame(self.outer, bg='#2a2a2a', height=34)
-        self.control_bar.pack_propagate(False)
-
         B = {
-            'bg': '#3a3a3a', 'fg': '#cccccc', 'relief': tk.FLAT,
-            'font': ('Microsoft YaHei', 9), 'padx': 10, 'pady': 3,
+            'bg': '#3d3d3d', 'fg': '#cccccc', 'relief': tk.FLAT,
+            'font': ('Microsoft YaHei', 9), 'padx': 8, 'pady': 2,
             'activebackground': '#555555', 'activeforeground': '#ffffff',
-            'cursor': 'hand2',
+            'cursor': 'hand2', 'bd': 0,
         }
 
-        self.btn_open = tk.Button(self.control_bar, text='Open', command=self._on_open, **B)
-        self.btn_open.pack(side=tk.LEFT, padx=(8, 2), pady=4)
+        self.btn_open = tk.Button(self.ctrl_frame, text='Open', command=self._on_open, **B)
+        self.btn_open.pack(side=tk.LEFT, padx=(6, 1), pady=4)
 
-        self.btn_color = tk.Button(self.control_bar, text='Font Color', command=self._on_color, **B)
-        self.btn_color.pack(side=tk.LEFT, padx=2, pady=4)
+        self.btn_save = tk.Button(self.ctrl_frame, text='Save', command=self._on_save, **B)
+        self.btn_save.pack(side=tk.LEFT, padx=1, pady=4)
 
-        self.btn_save = tk.Button(self.control_bar, text='Save Progress', command=self._on_save, **B)
-        self.btn_save.pack(side=tk.LEFT, padx=2, pady=4)
+        self.btn_load = tk.Button(self.ctrl_frame, text='Progress', command=self._on_load_progress, **B)
+        self.btn_load.pack(side=tk.LEFT, padx=1, pady=4)
 
-        self.btn_load = tk.Button(self.control_bar, text='Load Progress', command=self._on_load_progress, **B)
-        self.btn_load.pack(side=tk.LEFT, padx=2, pady=4)
+        tk.Label(self.ctrl_frame, text='  Font:', bg='#2d2d2d', fg='#999999',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(10, 0))
 
-        tk.Label(
-            self.control_bar, text='  Size:', bg='#2a2a2a', fg='#999999',
-            font=('Microsoft YaHei', 9),
-        ).pack(side=tk.LEFT, padx=(12, 0))
+        self.btn_font = tk.Button(self.ctrl_frame, text='Color', command=self._on_font_color, **B)
+        self.btn_font.pack(side=tk.LEFT, padx=1, pady=4)
+
+        tk.Label(self.ctrl_frame, text='BG:', bg='#2d2d2d', fg='#999999',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(6, 0))
+
+        self.btn_bg = tk.Button(self.ctrl_frame, text='Color', command=self._on_bg_color, **B)
+        self.btn_bg.pack(side=tk.LEFT, padx=1, pady=4)
+
+        self.btn_bg_trans = tk.Button(
+            self.ctrl_frame, text='Transparent', command=self._on_bg_transparent, **B)
+        self.btn_bg_trans.pack(side=tk.LEFT, padx=1, pady=4)
+
+        tk.Label(self.ctrl_frame, text='Size:', bg='#2d2d2d', fg='#999999',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(8, 0))
 
         self.size_var = tk.IntVar(value=self.font_size)
         self.size_spin = tk.Spinbox(
-            self.control_bar, from_=8, to=48, width=3,
+            self.ctrl_frame, from_=8, to=48, width=3,
             textvariable=self.size_var, command=self._on_font_change,
-            bg='#3a3a3a', fg='#cccccc', buttonbackground='#4a4a4a',
-            relief=tk.FLAT, font=('Consolas', 10),
+            bg='#3d3d3d', fg='#cccccc', buttonbackground='#4d4d4d',
+            relief=tk.FLAT, font=('Consolas', 10), bd=0,
         )
-        self.size_spin.pack(side=tk.LEFT, padx=4, pady=4)
+        self.size_spin.pack(side=tk.LEFT, padx=3, pady=4)
 
-    def _show_controls(self):
-        if not getattr(self, '_controls_visible', False):
-            self.control_bar.pack(before=self.content, fill=tk.X)
-            self._controls_visible = True
+        # close button (right side)
+        self.btn_close = tk.Button(
+            self.ctrl_frame, text='X', command=self._on_close,
+            bg='#3d3d3d', fg='#cc8888', relief=tk.FLAT,
+            font=('Microsoft YaHei', 10, 'bold'), padx=10, pady=2,
+            activebackground='#883333', activeforeground='#ffffff',
+            cursor='hand2', bd=0,
+        )
+        self.btn_close.pack(side=tk.RIGHT, padx=(0, 4), pady=4)
 
-    def _hide_controls(self):
-        if getattr(self, '_controls_visible', False):
-            self.control_bar.pack_forget()
-            self._controls_visible = False
+        # top pin
+        self.top_var = tk.BooleanVar(value=False)
+        self.btn_top = tk.Button(
+            self.ctrl_frame, text='Pin', command=self._on_toggle_top, **B)
+        self.btn_top.pack(side=tk.RIGHT, padx=1, pady=4)
+
+    # ── Context menu (right-click) ──────────────────────────────
+
+    def _build_context_menu(self):
+        self.ctx_menu = tk.Menu(self.root, tearoff=0, bg='#2d2d2d', fg='#cccccc',
+                                activebackground='#4a6a8a', activeforeground='#ffffff',
+                                font=('Microsoft YaHei', 10))
+        self.ctx_menu.add_command(label='Open', command=self._on_open)
+        self.ctx_menu.add_command(label='Save Progress', command=self._on_save)
+        self.ctx_menu.add_command(label='Load Progress', command=self._on_load_progress)
+        self.ctx_menu.add_separator()
+        self.ctx_menu.add_command(label='Font Color', command=self._on_font_color)
+        self.ctx_menu.add_command(label='Background Color', command=self._on_bg_color)
+        self.ctx_menu.add_command(label='Background Transparent', command=self._on_bg_transparent)
+        self.ctx_menu.add_separator()
+        self.ctx_menu.add_checkbutton(label='Always on Top', variable=self.top_var,
+                                      command=self._on_toggle_top)
+        self.ctx_menu.add_separator()
+        self.ctx_menu.add_command(label='Minimize', command=self._on_minimize)
+        self.ctx_menu.add_command(label='Close', command=self._on_close)
+
+    # ── Overlay show / hide ─────────────────────────────────────
+
+    def _show_overlays(self):
+        w = self.root.winfo_width()
+
+        if not self._controls_up:
+            self.ctrl_frame.place(x=0, y=0, width=w, height=self._ctrl_h)
+            self._controls_up = True
+
+        if not self._info_up:
+            h = self.root.winfo_height()
+            self.info_frame.place(x=0, y=h - self._info_h, width=w, height=self._info_h)
+            self._info_up = True
+
+        # resize grip
+        wh = self.root.winfo_height()
+        ww = self.root.winfo_width()
+        self.grip.place(x=ww - self._grip_size, y=wh - self._grip_size,
+                        width=self._grip_size, height=self._grip_size)
+
+    def _hide_overlays(self):
+        if self._controls_up:
+            self.ctrl_frame.place_forget()
+            self._controls_up = False
+        if self._info_up:
+            self.info_frame.place_forget()
+            self._info_up = False
+        self.grip.place_forget()
 
     # ── Event Binding ───────────────────────────────────────────
 
@@ -213,24 +280,35 @@ class ReaderApp:
         self.canvas.bind('<Button-5>', lambda e: self._scroll(3))
         self.canvas.bind('<Configure>', self._on_resize)
 
+        # window drag / resize
+        self.canvas.bind('<Button-1>', self._drag_start)
+        self.canvas.bind('<B1-Motion>', self._drag_motion)
+        self.canvas.bind('<ButtonRelease-1>', self._drag_stop)
+        self.grip.bind('<Button-1>', self._resize_start)
+        self.grip.bind('<B1-Motion>', self._resize_motion)
+
+        # cursor shape when near edges
+        self.canvas.bind('<Motion>', self._on_motion)
+
+        # right-click context menu
+        self.canvas.bind('<Button-3>', self._on_right_click)
+
+        # keyboard
         self.root.bind('<Up>', lambda e: self._scroll(-1))
         self.root.bind('<Down>', lambda e: self._scroll(1))
         self.root.bind('<Prior>', lambda e: self._page(-1))
         self.root.bind('<Next>', lambda e: self._page(1))
-        self.root.bind('<Home>', lambda e: self._go(0))
-        self.root.bind('<End>', lambda e: self._go(-1))
+        self.root.bind('<Home>', lambda e: self._go_start())
+        self.root.bind('<End>', lambda e: self._go_end())
         self.root.bind('<Control-o>', lambda e: self._on_open())
         self.root.bind('<Control-s>', lambda e: self._on_save())
         self.root.bind('<Control-l>', lambda e: self._on_load_progress())
-        self.root.bind('<Escape>', lambda e: self.root.iconify())
+        self.root.bind('<Escape>', lambda e: self._on_minimize())
         self.root.bind('<Control-q>', lambda e: self._on_close())
-
-        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     def _on_enter(self, event):
         self._hovering = True
-        self.root.attributes('-alpha', 0.92)
-        self._show_controls()
+        self._show_overlays()
 
     def _on_leave(self, event):
         x, y = self.root.winfo_pointerxy()
@@ -238,21 +316,104 @@ class ReaderApp:
         rw, rh = self.root.winfo_width(), self.root.winfo_height()
         if not (rx <= x <= rx + rw and ry <= y <= ry + rh):
             self._hovering = False
-            self.root.attributes('-alpha', 0.55)
-            self._hide_controls()
+            self._hide_overlays()
 
     def _on_mousewheel(self, event):
         self._scroll(-1 if event.delta > 0 else 1)
 
+    # ── window drag ─────────────────────────────────────────────
+
+    def _drag_start(self, event):
+        m = self._resize_margin
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        in_right = event.x >= w - m
+        in_bottom = event.y >= h - m
+
+        if in_right and in_bottom:
+            self._resize_mode = 'se'
+        elif in_right:
+            self._resize_mode = 'e'
+        elif in_bottom:
+            self._resize_mode = 's'
+        else:
+            self._resize_mode = ''
+            self._drag_x = event.x
+            self._drag_y = event.y
+
+    def _drag_motion(self, event):
+        if self._resize_mode:
+            self._apply_resize(event)
+        elif hasattr(self, '_drag_x'):
+            dx = event.x - self._drag_x
+            dy = event.y - self._drag_y
+            if abs(dx) > 2 or abs(dy) > 2:
+                x = self.root.winfo_x() + dx
+                y = self.root.winfo_y() + dy
+                self.root.geometry(f'+{x}+{y}')
+
+    def _drag_stop(self, event):
+        self._resize_mode = ''
+
+    def _resize_start(self, event):
+        self._resize_mode = 'se'
+
+    def _resize_motion(self, event):
+        if self._resize_mode:
+            self._apply_resize(event)
+
+    def _apply_resize(self, event):
+        """Resize the window by mouse position (root-relative coords)."""
+        mode = self._resize_mode
+        new_w = self.root.winfo_width()
+        new_h = self.root.winfo_height()
+        min_w, min_h = 320, 200
+
+        if 'e' in mode:
+            new_w = max(min_w, event.x + 10)
+        if 's' in mode:
+            new_h = max(min_h, event.y + 10)
+
+        self.root.geometry(f'{new_w}x{new_h}')
+
+    # ── edge-resize detection ───────────────────────────────────
+
+    def _on_motion(self, event):
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        m = self._resize_margin
+        in_right = event.x >= w - m
+        in_bottom = event.y >= h - m
+
+        if in_right and in_bottom:
+            self.canvas.configure(cursor='bottom_right_corner')
+        elif in_right:
+            self.canvas.configure(cursor='right_side')
+        elif in_bottom:
+            self.canvas.configure(cursor='bottom_side')
+        else:
+            self.canvas.configure(cursor='xterm')
+
     def _on_resize(self, event):
         if event.widget == self.canvas:
             self._render()
+            self._reposition_overlays()
 
-    def _on_scrollbar_drag(self, value):
-        pct = float(value)
-        if self.fh.line_count > 0:
-            self.top_line = int((pct / 100.0) * max(0, self.fh.line_count - self._visible()))
-            self._render()
+    def _reposition_overlays(self):
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        if self._controls_up:
+            self.ctrl_frame.place(x=0, y=0, width=w, height=self._ctrl_h)
+        if self._info_up:
+            self.info_frame.place(x=0, y=h - self._info_h, width=w, height=self._info_h)
+        if self._controls_up or self._info_up:
+            self.grip.place(x=w - self._grip_size, y=h - self._grip_size,
+                            width=self._grip_size, height=self._grip_size)
+
+    # ── right-click ─────────────────────────────────────────────
+
+    def _on_right_click(self, event):
+        self.ctx_menu.tk_popup(event.x_root, event.y_root)
 
     # ── Navigation ──────────────────────────────────────────────
 
@@ -269,11 +430,12 @@ class ReaderApp:
     def _page(self, direction):
         self._scroll(direction * self._visible())
 
-    def _go(self, pos):
-        if pos == 0:
-            self.top_line = 0
-        else:
-            self.top_line = max(0, self.fh.line_count - self._visible())
+    def _go_start(self):
+        self.top_line = 0
+        self._render()
+
+    def _go_end(self):
+        self.top_line = max(0, self.fh.line_count - self._visible())
         self._render()
 
     def _go_to_offset(self, byte_offset):
@@ -285,6 +447,13 @@ class ReaderApp:
 
     def _render(self):
         self.canvas.delete('all')
+
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+
+        # background fill (skip when fully transparent)
+        if self.bg_color != TRANS and w > 0 and h > 0:
+            self.canvas.create_rectangle(0, 0, w, h, fill=self.bg_color,
+                                         outline='', width=0)
 
         if not self.fh.filepath or self.fh.line_count == 0:
             self._draw_welcome()
@@ -311,24 +480,33 @@ class ReaderApp:
             y += self.line_height
 
         self._update_info()
-        self._update_scrollbar()
 
     def _draw_welcome(self):
         w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if w > 50 and h > 50:
+            color = '#888888' if self.bg_color == TRANS else (
+                '#000000' if self._is_light_bg() else '#cccccc')
             self.canvas.create_text(
                 w // 2, h // 2,
                 text=(
                     'No file loaded.\n\n'
-                    'Ctrl+O  Open a text file\n'
-                    'Ctrl+S  Save progress\n'
-                    'Ctrl+L  Load progress\n'
-                    '\n'
-                    '未加载文件。\n'
-                    'Ctrl+O  打开文件  Ctrl+S  保存进度'
+                    'Ctrl+O  Open     Ctrl+S  Save Progress\n'
+                    'Ctrl+L  Progress\n'
+                    'Right-click for menu'
                 ),
-                fill='#555555', font=(self.font_family, 12), justify=tk.CENTER,
+                fill=color, font=(self.font_family, 12), justify=tk.CENTER,
             )
+
+    def _is_light_bg(self):
+        if self.bg_color == TRANS:
+            return True
+        try:
+            r = int(self.bg_color[1:3], 16)
+            g = int(self.bg_color[3:5], 16)
+            b = int(self.bg_color[5:7], 16)
+            return (r * 299 + g * 587 + b * 114) / 1000 > 128
+        except Exception:
+            return False
 
     def _update_info(self):
         if not self.fh.filepath:
@@ -343,11 +521,6 @@ class ReaderApp:
             f'  Ln {self.top_line + 1:,} / {total:,}  |  {pct:.1f}%  |  {fname}'
         )
 
-    def _update_scrollbar(self):
-        if self.fh.line_count > 0:
-            pct = (self.top_line / max(1, self.fh.line_count - self._visible())) * 100
-            self.scroll_var.set(pct)
-
     # ── File Operations ─────────────────────────────────────────
 
     def _load_file(self, filepath):
@@ -356,7 +529,6 @@ class ReaderApp:
             self.root.update()
             self.fh.load_file(filepath)
             self.top_line = 0
-            self.root.title(f'TXT Reader - {os.path.basename(filepath)}')
             self._render()
             self.pm.set_last_session(filepath, 0)
         except Exception as e:
@@ -388,13 +560,29 @@ class ReaderApp:
             self.pm.set_last_session(self.fh.filepath, offset)
         self.root.destroy()
 
+    def _on_minimize(self):
+        self.root.iconify()
+
     # ── Appearance ──────────────────────────────────────────────
 
-    def _on_color(self):
-        result = colorchooser.askcolor(color=self.font_color, title='Choose Font Color')
+    def _on_font_color(self):
+        result = colorchooser.askcolor(color=self.font_color,
+                                       title='Choose Font Color')
         if result and result[1]:
             self.font_color = result[1]
             self._render()
+
+    def _on_bg_color(self):
+        initial = self.bg_color if self.bg_color != TRANS else '#1e1e1e'
+        result = colorchooser.askcolor(color=initial,
+                                       title='Choose Background Color')
+        if result and result[1]:
+            self.bg_color = result[1]
+            self._render()
+
+    def _on_bg_transparent(self):
+        self.bg_color = TRANS
+        self._render()
 
     def _on_font_change(self):
         try:
@@ -403,6 +591,11 @@ class ReaderApp:
             self._render()
         except Exception:
             pass
+
+    def _on_toggle_top(self):
+        self._on_top = not self._on_top
+        self.top_var.set(self._on_top)
+        self.root.attributes('-topmost', self._on_top)
 
     # ── Progress Management ─────────────────────────────────────
 
@@ -449,7 +642,6 @@ class ReaderApp:
         dlg.transient(self.root)
         dlg.grab_set()
 
-        # Center
         dlg.update_idletasks()
         px = self.root.winfo_rootx() + (self.root.winfo_width() - 500) // 2
         py = self.root.winfo_rooty() + (self.root.winfo_height() - 360) // 2
@@ -524,6 +716,6 @@ class ReaderApp:
 
     def run(self):
         self.root.geometry('900x650')
-        self.root.minsize(350, 250)
+        self.root.minsize(320, 200)
         self.root.after(50, self._render)
         self.root.mainloop()
