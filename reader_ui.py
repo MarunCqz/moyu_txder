@@ -26,9 +26,17 @@ if sys.platform == 'win32':
     import ctypes
     from ctypes import wintypes
 
+    # WPARAM / LPARAM are pointer-sized unsigned / signed ints
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        _WPARAM = ctypes.c_ulonglong
+        _LPARAM = ctypes.c_longlong
+    else:
+        _WPARAM = ctypes.c_ulong
+        _LPARAM = ctypes.c_long
+
     _WNDPROC = ctypes.WINFUNCTYPE(
         ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
-        ctypes.c_wparam, ctypes.c_lparam)
+        _WPARAM, _LPARAM)
 
     class NOTIFYICONDATA(ctypes.Structure):
         _fields_ = [
