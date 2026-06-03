@@ -95,7 +95,9 @@ class ReaderApp:
         self.root = tk.Tk()
 
         # ── borderless + transparent-background capable ─────────
-        self.root.overrideredirect(True)
+        # Do NOT use overrideredirect — it kills taskbar entry and resize
+        # borders.  Instead we strip the title bar via Windows API after
+        # the window is mapped (see _apply_borderless_style).
         self.root.configure(bg=TRANS)
         self.root.attributes('-transparentcolor', TRANS)
         self.root.attributes('-alpha', 1.0)
@@ -114,8 +116,6 @@ class ReaderApp:
         self._on_top = False
         self._drag_x = 0
         self._drag_y = 0
-        self._resize_mode = ''
-        self._resize_margin = 6
 
         # global exception handler — critical for pyinstaller -w builds
         self.root.report_callback_exception = self._on_unhandled_error
@@ -124,6 +124,9 @@ class ReaderApp:
         self._build_ui()
         self._build_context_menu()
         self._bind_events()
+
+        # Apply borderless style after window is mapped (needs HWND on Windows)
+        self.root.after(50, self._apply_borderless_style)
 
         self.root.after(100, self._load_last_session)
 
@@ -141,12 +144,6 @@ class ReaderApp:
             cursor='xterm',
         )
         self.canvas.pack(fill=tk.BOTH, expand=True)
-
-        # --- resize grip (bottom-right) --------------------------
-        self._grip_size = 14
-        self.grip = tk.Label(
-            self.root, text='', bg='#333333', cursor='bottom_right_corner',
-        )
 
         # --- control overlay (top, placed on hover) --------------
         self._ctrl_h = 34
@@ -261,12 +258,6 @@ class ReaderApp:
             self.info_frame.place(x=0, y=h - self._info_h, width=w, height=self._info_h)
             self._info_up = True
 
-        # resize grip
-        wh = self.root.winfo_height()
-        ww = self.root.winfo_width()
-        self.grip.place(x=ww - self._grip_size, y=wh - self._grip_size,
-                        width=self._grip_size, height=self._grip_size)
-
     def _hide_overlays(self):
         if self._controls_up:
             self.ctrl_frame.place_forget()
@@ -274,7 +265,6 @@ class ReaderApp:
         if self._info_up:
             self.info_frame.place_forget()
             self._info_up = False
-        self.grip.place_forget()
 
     # ── Event Binding ───────────────────────────────────────────
 
@@ -286,15 +276,9 @@ class ReaderApp:
         self.canvas.bind('<Button-5>', lambda e: self._scroll(3))
         self.canvas.bind('<Configure>', self._on_resize)
 
-        # window drag / resize
+        # window drag (title bar is gone, so drag canvas to move)
         self.canvas.bind('<Button-1>', self._drag_start)
         self.canvas.bind('<B1-Motion>', self._drag_motion)
-        self.canvas.bind('<ButtonRelease-1>', self._drag_stop)
-        self.grip.bind('<Button-1>', self._resize_start)
-        self.grip.bind('<B1-Motion>', self._resize_motion)
-
-        # cursor shape when near edges
-        self.canvas.bind('<Motion>', self._on_motion)
 
         # right-click context menu
         self.canvas.bind('<Button-3>', self._on_right_click)
@@ -327,78 +311,19 @@ class ReaderApp:
     def _on_mousewheel(self, event):
         self._scroll(-1 if event.delta > 0 else 1)
 
-    # ── window drag ─────────────────────────────────────────────
+    # ── window drag (canvas acts as the drag handle) ────────────
 
     def _drag_start(self, event):
-        m = self._resize_margin
-        w = self.root.winfo_width()
-        h = self.root.winfo_height()
-        in_right = event.x >= w - m
-        in_bottom = event.y >= h - m
-
-        if in_right and in_bottom:
-            self._resize_mode = 'se'
-        elif in_right:
-            self._resize_mode = 'e'
-        elif in_bottom:
-            self._resize_mode = 's'
-        else:
-            self._resize_mode = ''
-            self._drag_x = event.x
-            self._drag_y = event.y
+        self._drag_x = event.x
+        self._drag_y = event.y
 
     def _drag_motion(self, event):
-        if self._resize_mode:
-            self._apply_resize(event)
-        elif hasattr(self, '_drag_x'):
-            dx = event.x - self._drag_x
-            dy = event.y - self._drag_y
-            if abs(dx) > 2 or abs(dy) > 2:
-                x = self.root.winfo_x() + dx
-                y = self.root.winfo_y() + dy
-                self.root.geometry(f'+{x}+{y}')
-
-    def _drag_stop(self, event):
-        self._resize_mode = ''
-
-    def _resize_start(self, event):
-        self._resize_mode = 'se'
-
-    def _resize_motion(self, event):
-        if self._resize_mode:
-            self._apply_resize(event)
-
-    def _apply_resize(self, event):
-        """Resize the window by mouse position (root-relative coords)."""
-        mode = self._resize_mode
-        new_w = self.root.winfo_width()
-        new_h = self.root.winfo_height()
-        min_w, min_h = 320, 200
-
-        if 'e' in mode:
-            new_w = max(min_w, event.x + 10)
-        if 's' in mode:
-            new_h = max(min_h, event.y + 10)
-
-        self.root.geometry(f'{new_w}x{new_h}')
-
-    # ── edge-resize detection ───────────────────────────────────
-
-    def _on_motion(self, event):
-        w = self.root.winfo_width()
-        h = self.root.winfo_height()
-        m = self._resize_margin
-        in_right = event.x >= w - m
-        in_bottom = event.y >= h - m
-
-        if in_right and in_bottom:
-            self.canvas.configure(cursor='bottom_right_corner')
-        elif in_right:
-            self.canvas.configure(cursor='right_side')
-        elif in_bottom:
-            self.canvas.configure(cursor='bottom_side')
-        else:
-            self.canvas.configure(cursor='xterm')
+        dx = event.x - self._drag_x
+        dy = event.y - self._drag_y
+        if abs(dx) > 2 or abs(dy) > 2:
+            x = self.root.winfo_x() + dx
+            y = self.root.winfo_y() + dy
+            self.root.geometry(f'+{x}+{y}')
 
     def _on_resize(self, event):
         if event.widget == self.canvas:
@@ -412,9 +337,6 @@ class ReaderApp:
             self.ctrl_frame.place(x=0, y=0, width=w, height=self._ctrl_h)
         if self._info_up:
             self.info_frame.place(x=0, y=h - self._info_h, width=w, height=self._info_h)
-        if self._controls_up or self._info_up:
-            self.grip.place(x=w - self._grip_size, y=h - self._grip_size,
-                            width=self._grip_size, height=self._grip_size)
 
     # ── right-click ─────────────────────────────────────────────
 
@@ -566,12 +488,56 @@ class ReaderApp:
             self.pm.set_last_session(self.fh.filepath, offset)
         self.root.destroy()
 
+    def _apply_borderless_style(self):
+        """Strip title bar while keeping resize borders and taskbar entry.
+
+        On Windows this uses the native window-style API so the window
+        remains fully managed (resize, snap, taskbar, Alt+Tab all work).
+        On other platforms we fall back to overrideredirect.
+        """
+        self.root.update_idletasks()
+
+        if sys.platform != 'win32':
+            self.root.overrideredirect(True)
+            return
+
+        import ctypes
+
+        GWL_STYLE = -16
+        GWL_EXSTYLE = -20
+        WS_CAPTION = 0x00C00000
+        WS_SYSMENU = 0x00080000
+        WS_THICKFRAME = 0x00040000
+        WS_MINIMIZEBOX = 0x00020000
+        WS_MAXIMIZEBOX = 0x00010000
+        WS_EX_APPWINDOW = 0x00040000
+        WS_EX_TOOLWINDOW = 0x00000080
+
+        hwnd = self.root.winfo_id()
+
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        # Remove titlebar, keep resize border + min/max boxes
+        new_style = style & ~(WS_CAPTION | WS_SYSMENU)
+        new_style |= WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
+
+        exstyle = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        exstyle |= WS_EX_APPWINDOW
+        exstyle &= ~WS_EX_TOOLWINDOW
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle)
+
+        # Tell DWM to re-render the non-client area
+        SWP_FRAMECHANGED = 0x0020
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, flags)
+
     def _on_minimize(self):
-        """Minimize – use withdraw as safe fallback for borderless windows."""
-        try:
-            self.root.iconify()
-        except Exception:
-            self.root.withdraw()
+        """Minimize to taskbar — works natively now that the window is managed."""
+        self.root.iconify()
 
     def _on_unhandled_error(self, exc, val, tb):
         """Log unhandled tkinter errors so pyinstaller -w builds don't
