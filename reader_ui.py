@@ -1,7 +1,9 @@
 """Reader UI v2: borderless window, overlay controls, true transparency."""
 
 import os
+import sys
 import json
+import traceback
 import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox, simpledialog
 from datetime import datetime
@@ -100,9 +102,10 @@ class ReaderApp:
 
         # ── state ───────────────────────────────────────────────
         self.top_line = 0
-        self.font_color = '#E0E0E0'
-        self.bg_color = TRANS               # TRANS = fully transparent
+        self.font_color = '#FFFFFF'
+        self.bg_color = '#000000'
         self.font_family = 'Microsoft YaHei'
+        self.font_fallback = 'TkFixedFont'
         self.font_size = 14
         self.line_height = 22
         self._hovering = False
@@ -113,6 +116,9 @@ class ReaderApp:
         self._drag_y = 0
         self._resize_mode = ''
         self._resize_margin = 6
+
+        # global exception handler — critical for pyinstaller -w builds
+        self.root.report_callback_exception = self._on_unhandled_error
 
         self._calc_line_height()
         self._build_ui()
@@ -561,7 +567,29 @@ class ReaderApp:
         self.root.destroy()
 
     def _on_minimize(self):
-        self.root.iconify()
+        """Minimize – use withdraw as safe fallback for borderless windows."""
+        try:
+            self.root.iconify()
+        except Exception:
+            self.root.withdraw()
+
+    def _on_unhandled_error(self, exc, val, tb):
+        """Log unhandled tkinter errors so pyinstaller -w builds don't
+        silently crash.  Writes to data/error.log and shows a messagebox."""
+        msg = ''.join(traceback.format_exception(exc, val, tb))
+        try:
+            with open(os.path.join(_app_dir(), 'error.log'), 'a', encoding='utf-8') as f:
+                f.write(f'[{datetime.now().isoformat()}] {msg}\n')
+        except Exception:
+            pass
+        try:
+            messagebox.showerror(
+                'TXT Reader Error',
+                f'An unexpected error occurred:\n\n{val}\n\n'
+                f'Details written to data/error.log'
+            )
+        except Exception:
+            pass
 
     # ── Appearance ──────────────────────────────────────────────
 
