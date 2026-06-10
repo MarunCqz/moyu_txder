@@ -4,6 +4,8 @@ import os
 import sys
 import json
 import glob
+import signal
+import subprocess
 import traceback
 import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox, simpledialog
@@ -19,7 +21,10 @@ def _app_dir():
     return d
 
 PROGRESS_FILE = os.path.join(_app_dir(), 'progress.json')
-TRANS = '#010203'   # sentinel colour for transparent-background pixels
+LOCK_FILE = os.path.join(_app_dir(), 'TXTReader.lock')
+TRANS = None
+TRANSLUCENT_BG = '#050505'
+TRANSLUCENT_ALPHA = 0.72
 
 # ── System Tray (Windows only, ctypes) ─────────────────────────
 
@@ -34,9 +39,10 @@ if sys.platform == 'win32':
     else:
         _WPARAM = ctypes.c_ulong
         _LPARAM = ctypes.c_long
+    _LRESULT = _LPARAM
 
     _WNDPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
+        _LRESULT, ctypes.c_void_p, ctypes.c_uint,
         _WPARAM, _LPARAM)
 
     class NOTIFYICONDATA(ctypes.Structure):
@@ -71,8 +77,20 @@ if sys.platform == 'win32':
     GWL_WNDPROC  = -4
     GWL_EXSTYLE  = -20
     WS_EX_TRANSPARENT = 0x00000020
-    WM_NCHITTEST = 0x0084
-    HTCLIENT     = 1
+
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        GetWindowLongPtr = ctypes.windll.user32.GetWindowLongPtrW
+        SetWindowLongPtr = ctypes.windll.user32.SetWindowLongPtrW
+    else:
+        GetWindowLongPtr = ctypes.windll.user32.GetWindowLongW
+        SetWindowLongPtr = ctypes.windll.user32.SetWindowLongW
+
+    GetWindowLongPtr.restype = ctypes.c_void_p
+    GetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int]
+    SetWindowLongPtr.restype = ctypes.c_void_p
+    SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+    ctypes.windll.shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+    ctypes.windll.user32.CallWindowProcW.restype = _LRESULT
 
 
 class SystemTrayIcon:
@@ -90,21 +108,27 @@ class SystemTrayIcon:
         self._clicked = False
         self._rclicked = False
         self._visible = False
+        self._on_left = None
+        self._on_right = None
 
     # ── public API ──────────────────────────────────────────────
 
     def show(self, on_left_click=None, on_right_click=None):
         """Add the tray icon.  Callbacks receive no arguments."""
         if sys.platform != 'win32':
-            return
+            return False
         self._on_left = on_left_click
         self._on_right = on_right_click
         try:
-            self._add_icon()
+            if not self._add_icon():
+                self._restore_wndproc()
+                return False
             self.root.after(300, self._poll)
             self._visible = True
+            return True
         except Exception:
-            pass
+            self._restore_wndproc()
+            return False
 
     def hide(self):
         """Remove the tray icon."""
@@ -131,11 +155,10 @@ class SystemTrayIcon:
                                                  1, 16, 16, LR_SHARED)
 
         # subclass window proc
-        self._old_wndproc = ctypes.windll.user32.GetWindowLongW(
-            hwnd, GWL_WNDPROC)
+        self._old_wndproc = GetWindowLongPtr(hwnd, GWL_WNDPROC)
         self._new_wndproc_ref = _WNDPROC(self._wnd_proc)
-        ctypes.windll.user32.SetWindowLongW(
-            hwnd, GWL_WNDPROC, self._new_wndproc_ref)
+        SetWindowLongPtr(hwnd, GWL_WNDPROC,
+                         ctypes.cast(self._new_wndproc_ref, ctypes.c_void_p))
 
         nid = NOTIFYICONDATA()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
@@ -145,8 +168,10 @@ class SystemTrayIcon:
         nid.uCallbackMessage = self._cb_msg
         nid.hIcon = hicon
         nid.szTip = self.title
-        ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
+        if not ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+            return False
         self._nid = nid
+        return True
 
     def _del_icon(self):
         if self._nid:
@@ -157,8 +182,7 @@ class SystemTrayIcon:
     def _restore_wndproc(self):
         if self._old_wndproc is not None:
             hwnd = self.root.winfo_id()
-            ctypes.windll.user32.SetWindowLongW(
-                hwnd, GWL_WNDPROC, self._old_wndproc)
+            SetWindowLongPtr(hwnd, GWL_WNDPROC, ctypes.c_void_p(self._old_wndproc))
             self._old_wndproc = None
             self._new_wndproc_ref = None
 
@@ -242,6 +266,96 @@ class ProgressManager:
             self._save()
 
 
+class SingleInstanceGuard:
+    """Keeps one visible TXT Reader process per user data directory."""
+
+    def __init__(self, root):
+        self.root = root
+        self._path = LOCK_FILE
+        self._active = False
+
+    def acquire_or_prompt(self):
+        pid = self._read_pid()
+        if pid and pid != os.getpid() and self._pid_alive(pid):
+            kill_old = messagebox.askyesno(
+                'TXT Reader is already running',
+                'Another TXT Reader process appears to be running.\n\n'
+                'Terminate the previous process and start this one?')
+            if not kill_old:
+                return False
+            if not self._terminate_pid(pid):
+                messagebox.showerror(
+                    'TXT Reader',
+                    'Failed to terminate the previous process.\n'
+                    'Please close it from Task Manager and try again.')
+                return False
+        self._write_pid()
+        self._active = True
+        return True
+
+    def release(self):
+        if not self._active:
+            return
+        try:
+            if self._read_pid() == os.getpid():
+                os.remove(self._path)
+        except OSError:
+            pass
+        self._active = False
+
+    def _read_pid(self):
+        try:
+            with open(self._path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return int(data.get('pid', 0))
+        except Exception:
+            return None
+
+    def _write_pid(self):
+        with open(self._path, 'w', encoding='utf-8') as f:
+            json.dump({'pid': os.getpid()}, f)
+
+    def _pid_alive(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            if sys.platform != 'win32':
+                return False
+        if sys.platform == 'win32':
+            return self._pid_alive_windows(pid)
+        return False
+
+    def _pid_alive_windows(self, pid):
+        try:
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            code = wintypes.DWORD()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return bool(ok and code.value == STILL_ACTIVE)
+        except Exception:
+            return False
+
+    def _terminate_pid(self, pid):
+        try:
+            if sys.platform == 'win32':
+                result = subprocess.run(
+                    ['taskkill', '/PID', str(pid), '/T', '/F'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False)
+                return result.returncode == 0
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except Exception:
+            return False
+
+
 # ── Reader Application ─────────────────────────────────────────
 
 class ReaderApp:
@@ -255,15 +369,21 @@ class ReaderApp:
         self.pm = ProgressManager()
 
         self.root = tk.Tk()
+        self.guard = SingleInstanceGuard(self.root)
+        if not self.guard.acquire_or_prompt():
+            self._should_exit = True
+            self.root.destroy()
+            return
+        self._should_exit = False
+
         self.root.overrideredirect(True)
-        self.root.configure(bg=TRANS)
-        self.root.attributes('-transparentcolor', TRANS)
+        self.root.configure(bg=TRANSLUCENT_BG)
         self.root.attributes('-alpha', 1.0)
 
         # ── state ───────────────────────────────────────────────
         self.top_line = 0
         self.font_color = '#FFFFFF'
-        self.bg_color = '#000000'
+        self.bg_color = TRANS
         self.font_family = 'SimHei'
         self.font_fallback = 'Microsoft YaHei'
         self.font_size = 14
@@ -297,7 +417,8 @@ class ReaderApp:
 
     def _build_ui(self):
         self.canvas = tk.Canvas(
-            self.root, bg=TRANS, highlightthickness=0, bd=0, cursor='xterm')
+            self.root, bg=self._canvas_bg(), highlightthickness=0, bd=0,
+            cursor='xterm')
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         # control overlay (top, placed on hover)
@@ -351,6 +472,30 @@ class ReaderApp:
             bg='#3d3d3d', fg='#cccccc', buttonbackground='#4d4d4d',
             relief=tk.FLAT, font=('Consolas', 10), bd=0)
         self.size_spin.pack(side=tk.LEFT, padx=3, pady=4)
+
+        tk.Label(self.ctrl_frame, text='W:', bg='#2d2d2d', fg='#999999',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(8, 0))
+        self.width_var = tk.IntVar(value=900)
+        self.width_spin = tk.Spinbox(
+            self.ctrl_frame, from_=320, to=9999, increment=10, width=5,
+            textvariable=self.width_var, command=self._on_geometry_apply,
+            bg='#3d3d3d', fg='#cccccc', buttonbackground='#4d4d4d',
+            relief=tk.FLAT, font=('Consolas', 10), bd=0)
+        self.width_spin.pack(side=tk.LEFT, padx=2, pady=4)
+        tk.Label(self.ctrl_frame, text='H:', bg='#2d2d2d', fg='#999999',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(4, 0))
+        self.height_var = tk.IntVar(value=650)
+        self.height_spin = tk.Spinbox(
+            self.ctrl_frame, from_=200, to=9999, increment=10, width=5,
+            textvariable=self.height_var, command=self._on_geometry_apply,
+            bg='#3d3d3d', fg='#cccccc', buttonbackground='#4d4d4d',
+            relief=tk.FLAT, font=('Consolas', 10), bd=0)
+        self.height_spin.pack(side=tk.LEFT, padx=2, pady=4)
+        self.btn_apply_size = tk.Button(
+            self.ctrl_frame, text='Apply', command=self._on_geometry_apply, **B)
+        self.btn_apply_size.pack(side=tk.LEFT, padx=1, pady=4)
+        self.width_spin.bind('<Return>', lambda e: self._on_geometry_apply())
+        self.height_spin.bind('<Return>', lambda e: self._on_geometry_apply())
 
         self.top_var = tk.BooleanVar(value=False)
         self.btn_top = tk.Button(self.ctrl_frame, text='Pin', command=self._on_toggle_top, **B)
@@ -414,12 +559,16 @@ class ReaderApp:
         self.canvas.bind('<Button-4>', lambda e: self._scroll(-3))
         self.canvas.bind('<Button-5>', lambda e: self._scroll(3))
         self.canvas.bind('<Configure>', self._on_resize)
+        self.canvas.bind('<Motion>', self._update_resize_cursor)
 
         # window drag / resize — bound to ROOT so events fire even
         # when the mouse leaves the canvas (critical for edge-resize).
         self.root.bind('<Button-1>', self._drag_start)
         self.root.bind('<B1-Motion>', self._drag_motion)
         self.root.bind('<ButtonRelease-1>', self._drag_stop)
+        self.canvas.bind('<Button-1>', self._drag_start)
+        self.canvas.bind('<B1-Motion>', self._drag_motion)
+        self.canvas.bind('<ButtonRelease-1>', self._drag_stop)
 
         # right-click
         self.canvas.bind('<Button-3>', self._on_right_click)
@@ -454,19 +603,40 @@ class ReaderApp:
 
     # ── window drag / resize (screen-coordinate based) ──────────
 
-    def _drag_start(self, event):
-        x, y = event.x, event.y
+    def _drag_mode_at(self, x, y):
         w, h = self.root.winfo_width(), self.root.winfo_height()
         e = self.EDGE
+        left, right, top, bottom = x < e, x > w - e, y < e, y > h - e
+        mode = ''
+        if left:
+            mode += 'w'
+        elif right:
+            mode += 'e'
+        if top:
+            mode += 'n'
+        elif bottom:
+            mode += 's'
+        return mode or 'move'
 
-        # work out which edge(s) the click landed on
-        L, R, T, B = x < e, x > w - e, y < e, y > h - e
+    def _update_resize_cursor(self, event):
+        mode = self._drag_mode_at(event.x, event.y)
+        cursors = {
+            'n': 'sb_v_double_arrow',
+            's': 'sb_v_double_arrow',
+            'w': 'sb_h_double_arrow',
+            'e': 'sb_h_double_arrow',
+            'wn': 'size_nw_se',
+            'es': 'size_nw_se',
+            'en': 'size_ne_sw',
+            'ws': 'size_ne_sw',
+        }
+        self.canvas.configure(cursor=cursors.get(mode, 'xterm'))
 
-        self._drag_mode = 'move'
-        if R: self._drag_mode = 'e'
-        if L: self._drag_mode = 'w'
-        if B: self._drag_mode = 's' if not (L or R) else self._drag_mode + 's'
-        if T: self._drag_mode = 'n' if not (L or R) else self._drag_mode + 'n'
+    def _drag_start(self, event):
+        if event.widget not in (self.root, self.canvas):
+            return
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        self._drag_mode = self._drag_mode_at(event.x, event.y)
 
         # record origin (screen coords for robustness)
         self._d_ox = event.x_root
@@ -477,6 +647,8 @@ class ReaderApp:
         self._d_h0 = h
 
     def _drag_motion(self, event):
+        if event.widget not in (self.root, self.canvas):
+            return
         if not hasattr(self, '_drag_mode'):
             return
         dx = event.x_root - self._d_ox
@@ -504,12 +676,16 @@ class ReaderApp:
             new_y = self._d_y0 + (self._d_h0 - new_h)
 
         self.root.geometry(f'{new_w}x{new_h}+{new_x}+{new_y}')
+        self._sync_geometry_fields(new_w, new_h)
 
     def _drag_stop(self, event):
+        if event.widget not in (self.root, self.canvas):
+            return
         self._drag_mode = 'move'
 
     def _on_resize(self, event):
         if event.widget == self.canvas:
+            self._sync_geometry_fields()
             self._render()
             self._reposition_overlays()
 
@@ -558,8 +734,10 @@ class ReaderApp:
     def _render(self):
         self.canvas.delete('all')
         w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        self.canvas.configure(bg=self._canvas_bg())
+        self._apply_alpha()
 
-        if self.bg_color != TRANS and w > 0 and h > 0:
+        if self.bg_color is not TRANS and w > 0 and h > 0:
             self.canvas.create_rectangle(0, 0, w, h, fill=self.bg_color,
                                          outline='', width=0)
 
@@ -704,7 +882,7 @@ class ReaderApp:
         w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if w > 50 and h > 50:
             # visible colour against the current background
-            if self.bg_color == TRANS:
+            if self.bg_color is TRANS:
                 color = '#AAAAAA'
             elif self._is_light_bg():
                 color = '#222222'
@@ -720,6 +898,8 @@ class ReaderApp:
                 fill=color, font=(self.font_family, 12), justify=tk.CENTER)
 
     def _is_light_bg(self):
+        if self.bg_color is TRANS:
+            return False
         try:
             r = int(self.bg_color[1:3], 16)
             g = int(self.bg_color[3:5], 16)
@@ -776,23 +956,16 @@ class ReaderApp:
             offset = self.fh.line_to_offset(self.top_line)
             self.pm.set_last_session(self.fh.filepath, offset)
         self.tray.hide()
-        # Restore the original window procedure before destroying
-        if sys.platform == 'win32' and hasattr(self, '_old_wndproc'):
-            try:
-                hwnd = self.root.winfo_id()
-                ctypes.windll.user32.SetWindowLongW(
-                    hwnd, GWL_WNDPROC, self._old_wndproc)
-            except Exception:
-                pass
+        self.guard.release()
         self.root.destroy()
 
     # ── Borderless + click-through fix ─────────────────────────
 
     def _apply_borderless_style(self):
-        """Strip WS_EX_TRANSPARENT so transparent-colour pixels still
-        receive mouse events, and subclass the window procedure to
-        return HTCLIENT for every WM_NCHITTEST — this guarantees clicks
-        land on the window even over colour-keyed regions."""
+        """overrideredirect gives us a clean borderless window, but on
+        Windows layered-window styles may get WS_EX_TRANSPARENT which
+        makes clicks pass through.  Strip that bit so every pixel of the
+        window stays interactive."""
         self.root.update_idletasks()
         if sys.platform != 'win32':
             return
@@ -803,20 +976,6 @@ class ReaderApp:
             exstyle = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             exstyle &= ~WS_EX_TRANSPARENT
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle)
-
-            # ── WM_NCHITTEST subclass ─────────────────────────────
-            self._old_wndproc = ctypes.windll.user32.GetWindowLongW(
-                hwnd, GWL_WNDPROC)
-
-            def hit_test_proc(hwnd, msg, wparam, lparam):
-                if msg == WM_NCHITTEST:
-                    return HTCLIENT
-                return ctypes.windll.user32.CallWindowProcW(
-                    self._old_wndproc, hwnd, msg, wparam, lparam)
-
-            self._hit_wndproc_ref = _WNDPROC(hit_test_proc)
-            ctypes.windll.user32.SetWindowLongW(
-                hwnd, GWL_WNDPROC, self._hit_wndproc_ref)
         except Exception:
             pass
 
@@ -831,8 +990,10 @@ class ReaderApp:
                 self.root.withdraw()
             return
         self.root.withdraw()
-        self.tray.show(on_left_click=self._restore_from_tray,
-                       on_right_click=self._tray_right_click)
+        if not self.tray.show(on_left_click=self._restore_from_tray,
+                              on_right_click=self._tray_right_click):
+            self.root.deiconify()
+            self.root.iconify()
 
     def _restore_from_tray(self):
         self.tray.hide()
@@ -874,7 +1035,7 @@ class ReaderApp:
             self._render()
 
     def _on_bg_color(self):
-        initial = self.bg_color if self.bg_color != TRANS else '#1e1e1e'
+        initial = self.bg_color if self.bg_color is not TRANS else '#1e1e1e'
         result = colorchooser.askcolor(color=initial, title='Choose Background Color')
         if result and result[1]:
             self.bg_color = result[1]
@@ -896,6 +1057,35 @@ class ReaderApp:
         self._on_top = not self._on_top
         self.top_var.set(self._on_top)
         self.root.attributes('-topmost', self._on_top)
+
+    def _canvas_bg(self):
+        return TRANSLUCENT_BG if self.bg_color is TRANS else self.bg_color
+
+    def _apply_alpha(self):
+        alpha = TRANSLUCENT_ALPHA if self.bg_color is TRANS else 1.0
+        try:
+            self.root.attributes('-alpha', alpha)
+        except Exception:
+            pass
+
+    def _sync_geometry_fields(self, width=None, height=None):
+        try:
+            self.width_var.set(int(width if width is not None else self.root.winfo_width()))
+            self.height_var.set(int(height if height is not None else self.root.winfo_height()))
+        except Exception:
+            pass
+
+    def _on_geometry_apply(self):
+        try:
+            w = max(320, int(self.width_var.get()))
+            h = max(200, int(self.height_var.get()))
+        except Exception:
+            return
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        self.root.geometry(f'{w}x{h}+{x}+{y}')
+        self._sync_geometry_fields(w, h)
+        self._render()
 
     # ── Progress Management ─────────────────────────────────────
 
@@ -994,7 +1184,11 @@ class ReaderApp:
     # ── Entry ───────────────────────────────────────────────────
 
     def run(self):
+        if self._should_exit:
+            return
         self.root.geometry('900x650')
         self.root.minsize(320, 200)
+        self._sync_geometry_fields(900, 650)
+        self._apply_alpha()
         self.root.after(50, self._render)
         self.root.mainloop()
