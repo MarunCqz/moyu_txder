@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import glob
 import traceback
 import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox, simpledialog
@@ -70,6 +71,8 @@ if sys.platform == 'win32':
     GWL_WNDPROC  = -4
     GWL_EXSTYLE  = -20
     WS_EX_TRANSPARENT = 0x00000020
+    WM_NCHITTEST = 0x0084
+    HTCLIENT     = 1
 
 
 class SystemTrayIcon:
@@ -571,6 +574,17 @@ class ReaderApp:
             self._update_info()
             return
 
+        if self.bg_color == TRANS:
+            self._render_transparent(lines, w, h)
+        else:
+            self._render_solid(lines)
+
+        self._update_info()
+
+    # ── Render: solid background ──────────────────────────────────
+
+    def _render_solid(self, lines):
+        """Per-line rendering — no anti-aliasing artefacts on opaque bg."""
         y = 2
         limit = 2000
         font = (self.font_family, self.font_size)
@@ -581,7 +595,110 @@ class ReaderApp:
             self.canvas.create_text(6, y, text=display, anchor=tk.NW,
                                     fill=self.font_color, font=font)
             y += self.line_height
-        self._update_info()
+
+    # ── Render: transparent background ────────────────────────────
+
+    def _render_transparent(self, lines, w, h):
+        """Try PIL for proper alpha rendering; fall back to batched text."""
+        try:
+            self._render_with_pil(lines, w, h)
+        except ImportError:
+            self._render_transparent_fallback(lines)
+
+    def _render_with_pil(self, lines, w, h):
+        """Render text with Pillow for clean anti-aliasing on transparent bg."""
+        from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+        img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        font = self._get_pil_font()
+
+        y = 2
+        limit = 2000
+        for text in lines:
+            display = text.replace('\t', '    ')
+            if len(display) > limit:
+                display = display[:limit]
+            draw.text((6, y), display, fill=self.font_color, font=font)
+            y += self.line_height
+
+        self._pil_photo = ImageTk.PhotoImage(img)
+        self.canvas.create_image(0, 0, image=self._pil_photo, anchor=tk.NW)
+
+    def _render_transparent_fallback(self, lines):
+        """Single multi-line create_text — fewer artefacts than per-line."""
+        processed = []
+        limit = 2000
+        for text in lines:
+            display = text.replace('\t', '    ')
+            if len(display) > limit:
+                display = display[:limit]
+            processed.append(display)
+        combined = '\n'.join(processed)
+        self.canvas.create_text(6, 2, text=combined, anchor=tk.NW,
+                                fill=self.font_color,
+                                font=(self.font_family, self.font_size))
+
+    def _get_pil_font(self):
+        """Locate a TTF for the current font family, falling back to default."""
+        from PIL import ImageFont
+
+        size = self.font_size
+        font_name = self.font_family
+
+        # Font family → Windows filename mapping
+        name_map = {
+            'SimHei':           ['simhei.ttf'],
+            'Microsoft YaHei':  ['msyh.ttf', 'msyh.ttc', 'msyhbd.ttf'],
+            'SimSun':           ['simsun.ttc', 'simsun.ttf'],
+            'KaiTi':            ['kaiti.ttf'],
+            'FangSong':         ['fangsong.ttf'],
+            'Consolas':         ['consola.ttf', 'consolab.ttf'],
+            'Arial':            ['arial.ttf'],
+            'Courier New':      ['cour.ttf', 'courbd.ttf'],
+        }
+
+        candidates = name_map.get(font_name, [
+            font_name + '.ttf',
+            font_name + '.ttc',
+            font_name.lower() + '.ttf',
+        ])
+
+        fonts_dir = os.path.join(
+            os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts')
+
+        if os.path.isdir(fonts_dir):
+            # Try exact matches first
+            for cand in candidates:
+                path = os.path.join(fonts_dir, cand)
+                if os.path.exists(path):
+                    return ImageFont.truetype(path, size)
+
+            # Fallback: glob for partial matches
+            for cand in candidates:
+                base = os.path.splitext(cand)[0].lower()
+                pattern = os.path.join(fonts_dir, base + '.*')
+                matches = glob.glob(pattern)
+                if matches:
+                    return ImageFont.truetype(matches[0], size)
+
+            # Broad sweep — try any font containing the family name
+            try:
+                for entry in os.listdir(fonts_dir):
+                    low = entry.lower()
+                    if (low.endswith(('.ttf', '.ttc')) and
+                            font_name.lower().replace(' ', '') in low.replace(' ', '')):
+                        return ImageFont.truetype(
+                            os.path.join(fonts_dir, entry), size)
+            except Exception:
+                pass
+
+        # Last resort: arial.ttf on Windows, or PIL default
+        arial = os.path.join(fonts_dir, 'arial.ttf')
+        if os.path.exists(arial):
+            return ImageFont.truetype(arial, size)
+
+        return ImageFont.load_default()
 
     def _draw_welcome(self):
         w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
@@ -659,23 +776,47 @@ class ReaderApp:
             offset = self.fh.line_to_offset(self.top_line)
             self.pm.set_last_session(self.fh.filepath, offset)
         self.tray.hide()
+        # Restore the original window procedure before destroying
+        if sys.platform == 'win32' and hasattr(self, '_old_wndproc'):
+            try:
+                hwnd = self.root.winfo_id()
+                ctypes.windll.user32.SetWindowLongW(
+                    hwnd, GWL_WNDPROC, self._old_wndproc)
+            except Exception:
+                pass
         self.root.destroy()
 
     # ── Borderless + click-through fix ─────────────────────────
 
     def _apply_borderless_style(self):
-        """overrideredirect gives us a clean borderless window, but on
-        Windows transparentcolor layers may get WS_EX_TRANSPARENT which
-        makes clicks pass through.  Strip that bit so every pixel of the
-        window stays interactive."""
+        """Strip WS_EX_TRANSPARENT so transparent-colour pixels still
+        receive mouse events, and subclass the window procedure to
+        return HTCLIENT for every WM_NCHITTEST — this guarantees clicks
+        land on the window even over colour-keyed regions."""
         self.root.update_idletasks()
         if sys.platform != 'win32':
             return
         try:
             hwnd = self.root.winfo_id()
+
+            # ── strip WS_EX_TRANSPARENT ───────────────────────────
             exstyle = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             exstyle &= ~WS_EX_TRANSPARENT
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle)
+
+            # ── WM_NCHITTEST subclass ─────────────────────────────
+            self._old_wndproc = ctypes.windll.user32.GetWindowLongW(
+                hwnd, GWL_WNDPROC)
+
+            def hit_test_proc(hwnd, msg, wparam, lparam):
+                if msg == WM_NCHITTEST:
+                    return HTCLIENT
+                return ctypes.windll.user32.CallWindowProcW(
+                    self._old_wndproc, hwnd, msg, wparam, lparam)
+
+            self._hit_wndproc_ref = _WNDPROC(hit_test_proc)
+            ctypes.windll.user32.SetWindowLongW(
+                hwnd, GWL_WNDPROC, self._hit_wndproc_ref)
         except Exception:
             pass
 
